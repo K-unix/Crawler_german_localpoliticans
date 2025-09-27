@@ -1,0 +1,11 @@
+/target
+proxies.txt
+certs/
+backup/
+proxy-chain.pem
+api.sh
+switch_folder/
+tmp_depot/
+process_html/
+Erste_10_Zeilen__Vorschau_.csv
+.env
