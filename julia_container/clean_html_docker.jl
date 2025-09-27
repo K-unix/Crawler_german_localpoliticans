@@ -26,6 +26,19 @@ function get_env_var(key::String, default::String="")::String
     return val
 end
 
+function get_env_float(key::String, default::Float64)::Float64
+    val = get(ENV, key, "")
+    if isempty(val)
+        return default
+    end
+    try
+        return parse(Float64, strip(val))
+    catch
+        @warn "Invalid float value for $key; using default" value=val default=default
+        return default
+    end
+end
+
 @info "Loading configuration from environment variables..."
 const CONFIG = (
     S3_SOURCE_BUCKET      = get_env_var("S3_SOURCE_BUCKET"),
@@ -45,7 +58,8 @@ const CONFIG = (
     REDIS_QUEUE_NAME      = get_env_var("REDIS_QUEUE_NAME", "html_processing_queue"),
     REDIS_LOG_LIST        = get_env_var("REDIS_LOG_LIST", ""),
     OPENAI_MODEL          = get_env_var("OPENAI_MODEL", "gpt-4-turbo"),
-    OPENAI_API_ENDPOINT   = get_env_var("OPENAI_API_ENDPOINT", "/v1/chat/completions")
+    OPENAI_API_ENDPOINT   = get_env_var("OPENAI_API_ENDPOINT", "/v1/chat/completions"),
+    OPENAI_TEMPERATURE    = get_env_float("OPENAI_TEMPERATURE", 0.10),
 )
 
 const BATCH_SIZE = 20
@@ -472,6 +486,16 @@ function process_queue()
 
                 cleaned_html = clean_html_content(html_content)
 
+                @info "Uploading cleaned HTML to S3." bucket=CONFIG.S3_DESTINATION_BUCKET key=source_key
+                try
+                    upload_object(CONFIG.S3_DESTINATION_BUCKET, source_key, cleaned_html, "text/html; charset=utf-8")
+                    @info "Upload complete." key=source_key
+                catch err
+                    @error "Failed to upload cleaned HTML." bucket=CONFIG.S3_DESTINATION_BUCKET key=source_key exception=(err, catch_backtrace())
+                    json_lines[i] = nothing
+                    continue
+                end
+
                 custom_id = derive_custom_id(source_key)
                 user_message = string(OPENAI_USER_PREFIX, cleaned_html)
 
@@ -486,11 +510,13 @@ function process_queue()
                             Dict("role" => "user", "content" => user_message)
                         ],
                         "max_tokens" => 2048,
+                        "temperature" => CONFIG.OPENAI_TEMPERATURE,
                     ),
                     "metadata" => Dict(
                         "source_bucket" => CONFIG.S3_SOURCE_BUCKET,
                         "source_key" => source_key,
                         "cleaned_bucket" => CONFIG.S3_DESTINATION_BUCKET,
+                        "cleaned_key" => source_key,
                         "jsonl_bucket" => CONFIG.S3_JSONL_BUCKET,
                     ),
                 )
