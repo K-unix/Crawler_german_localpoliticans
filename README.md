@@ -276,7 +276,7 @@ Notes
 
 ## Architecture Diagram
 
-``` mermaid
+```mermaid
 flowchart LR
   subgraph Workers[Worker VMs]
     W1[Crawler Worker 1\n+Vector]
@@ -321,14 +321,14 @@ flowchart LR
   DBW -->|upserts| PG
 
   %% Optional direct path
-  R -->|json_to_db_queue (optional)| DBW
+  R -->|json_to_db_queue_optional| DBW
 
   %% Centralized logging
-  W1 -.->|Vector → Loki| L
-  W2 -.->|Vector → Loki| L
-  WN -.->|Vector → Loki| L
-  J  -.->|Vector → Loki| L
-  VP -.->|Vector → Loki| L
+  W1 -.->|Vector to Loki| L
+  W2 -.->|Vector to Loki| L
+  WN -.->|Vector to Loki| L
+  J  -.->|Vector to Loki| L
+  VP -.->|Vector to Loki| L
   G <--> L
 
   %% Notes
