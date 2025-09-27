@@ -1,11 +1,15 @@
-import openai
-import psycopg2
-import os
 import json
-import time
-import pandas as pd
+import os
 import re
+import time
 from datetime import datetime
+from typing import Optional
+
+import boto3
+import openai
+import pandas as pd
+import psycopg2
+from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -28,15 +32,42 @@ BENCHMARK_KOMMUNEN = ["muenchen", "berlin", "hamburg"]
 
 # File Paths
 OFFICIAL_DATA_FOLDER = "./official_data" # For benchmark .txt files
-RAW_HTML_FOLDER = "./raw_html"           # For all other raw .html files
-
 # Other Settings
 DB_QUERY = "SELECT name, partei, position, kommune FROM politicians_output;"
-BATCH_MODEL = "gpt-4o"
+BATCH_MODEL = "gpt-5-mini"
+BATCH_TEMPERATURE = 0.10
 BATCH_COMPLETION_WINDOW = "24h"
 BATCH_INPUT_FILENAME = "batch_judge_requests.jsonl"
 DETAILED_RESULTS_CSV = "validation_results_detailed.csv"
 HTML_REPORT_FILENAME = "validation_report.html"
+
+# --- S3 Configuration ---
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN")
+AWS_ENDPOINT_URL = os.getenv("AWS_ENDPOINT_URL") or None
+
+S3_CLEANED_BUCKET = (
+    os.getenv("VALIDATION_CLEANED_BUCKET")
+    or os.getenv("S3_DESTINATION_BUCKET")
+    or os.getenv("S3_CLEANED_BUCKET")
+)
+S3_CLEANED_PREFIX = os.getenv("VALIDATION_CLEANED_PREFIX", "")
+
+if not S3_CLEANED_BUCKET:
+    raise RuntimeError(
+        "VALIDATION_CLEANED_BUCKET or S3_DESTINATION_BUCKET must be set to locate cleaned HTML files."
+    )
+
+s3_client = boto3.client(
+    "s3",
+    region_name=AWS_REGION,
+    endpoint_url=AWS_ENDPOINT_URL,
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    aws_session_token=AWS_SESSION_TOKEN,
+)
 
 
 # --- PROMPT TEMPLATES ---
@@ -139,7 +170,25 @@ def fetch_pipeline_data(conn_params, query):
         print(f"❌ Database error: {e}")
         return []
 
-def prepare_batch_file(pipeline_data, official_data_folder, raw_html_folder, benchmark_list):
+def build_cleaned_key(source_key: str) -> str:
+    if not S3_CLEANED_PREFIX:
+        return source_key
+    return f"{S3_CLEANED_PREFIX.rstrip('/')}/{source_key.lstrip('/')}"
+
+
+def fetch_cleaned_html_from_s3(source_key: str) -> Optional[str]:
+    if not source_key:
+        return None
+    key = build_cleaned_key(source_key)
+    try:
+        response = s3_client.get_object(Bucket=S3_CLEANED_BUCKET, Key=key)
+        return response["Body"].read().decode("utf-8", errors="replace")
+    except (ClientError, BotoCoreError) as exc:
+        print(f"⚠️ Warning: Failed to download cleaned HTML from s3://{S3_CLEANED_BUCKET}/{key}. Error: {exc}")
+        return None
+
+
+def prepare_batch_file(pipeline_data, official_data_folder, benchmark_list):
     """Prepares the JSONL file with two-phase logic."""
     print("Preparing batch input file with two-phase logic...")
     requests = []
@@ -165,18 +214,15 @@ def prepare_batch_file(pipeline_data, official_data_folder, raw_html_folder, ben
 
         # Phase 2: Use raw .html file for all other Kommunen
         else:
-            data_path = os.path.join(raw_html_folder, f"{kommune_slug}.html") # Assuming .html extension
-            if os.path.exists(data_path):
-                with open(data_path, 'r', encoding='utf-8') as f:
-                    raw_html_data = f.read()
-                prompt = GERMAN_PROMPT_RAW_HTML.format(
-                    pipeline_output=pipeline_output_json,
-                    raw_html=raw_html_data
-                )
-            else:
-                print(f"⚠️ Warning: No raw HTML file found for {record['kommune']} at {data_path}")
+            cleaned_html = fetch_cleaned_html_from_s3(record.get('source_file'))
+            if cleaned_html is None:
+                print(f"⚠️ Warning: No cleaned HTML found in S3 for {record['kommune']} (source_file='{record.get('source_file')}'). Skipping.")
                 continue
-        
+            prompt = GERMAN_PROMPT_RAW_HTML.format(
+                pipeline_output=pipeline_output_json,
+                raw_html=cleaned_html
+            )
+
         requests.append({
             "custom_id": f"req_{record['kommune']}_{record['name']}".replace(" ", "_"),
             "method": "POST",
@@ -185,7 +231,7 @@ def prepare_batch_file(pipeline_data, official_data_folder, raw_html_folder, ben
                 "model": BATCH_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
                 "response_format": {"type": "json_object"},
-                "temperature": 0.0
+                "temperature": BATCH_TEMPERATURE
             }
         })
 
@@ -350,7 +396,7 @@ def main():
         print("No data fetched from the database. Exiting.")
         return
         
-    batch_input_file = prepare_batch_file(pipeline_data, OFFICIAL_DATA_FOLDER, RAW_HTML_FOLDER, BENCHMARK_KOMMUNEN)
+    batch_input_file = prepare_batch_file(pipeline_data, OFFICIAL_DATA_FOLDER, BENCHMARK_KOMMUNEN)
     
     if os.path.getsize(batch_input_file) == 0:
         print(" Batch input file is empty. This likely means no source files were found. Exiting.")
