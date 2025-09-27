@@ -2,17 +2,20 @@ rust_crawler — Distributed Web Crawler Pipeline
 
 **Overview**
 - Distributed crawler that pulls URL tasks from Redis, fetches pages through optional proxies, respects robots.txt + crawl delays, and stores results in S3.
-- Includes a seeder to populate initial URLs, a Python DB writer to persist LLM-extracted council data into Postgres, and an optional Julia worker to clean HTML.
+- Julia worker cleans HTML and emits JSONL batch inputs to S3 for the OpenAI Batch API. Each JSONL line includes a stable `custom_id` derived from the source HTML filename and request metadata.
+- Python DB writer discovers JSONL inputs, submits OpenAI batch jobs, polls for completion, downloads output files, and upserts one database row per JSONL output line into Postgres.
+- Seeder populates initial URLs into Redis; Vector centralizes logs into Loki/Grafana.
 
 **Architecture**
 - Redis queues orchestrate work:
   - `crawler:url_queue`: pending crawl tasks (JSON `{"url","depth"}`)
   - `crawler:visited_set`: deduplicates URLs
-  - `json_to_db_queue`: Python DB writer input (JSON with council member data)
-- Rust worker pulls from `crawler:url_queue`, fetches HTML, extracts links, pushes new tasks, and writes crawl metadata/HTML to S3.
-- Log forwarding sidecar (`vector` service) tails container logs and forwards structured JSON to:
-  - Redis (list key `REDIS_LOG_KEY`) and
-  - Loki (log store) for querying in Grafana.
+  - `html_processing_queue`: S3 object keys of saved HTML for the Julia worker
+  - `json_to_db_queue` (optional): direct JSON input to DB writer (bypass batch)
+- Rust worker pulls from `crawler:url_queue`, fetches HTML, extracts links, pushes new tasks, and writes crawl metadata and selected HTML to S3.
+- Julia worker downloads raw HTML from S3, removes scripts, and builds JSONL batch inputs targeting the OpenAI API; uploads JSONL files to S3 under a configured prefix.
+- Python DB writer discovers JSONL in S3, creates OpenAI Batch jobs, polls job status, downloads batch output files, and upserts to Postgres.
+- Log forwarding sidecar (`vector` service) tails container logs and forwards structured JSON to Redis and Loki for querying in Grafana.
 
 **Components**
 - Rust worker: `src/main.rs`
@@ -21,10 +24,12 @@ rust_crawler — Distributed Web Crawler Pipeline
 - Seeder: `src/bin/seeder.rs`
   - Seeds `visited_set` and pushes depth-0 tasks into `crawler:url_queue`.
 - Python DB writer: `python_container/db_writer.py`
-  - Listens on `json_to_db_queue`, upserts into Postgres table `council_members`.
-- Julia cleaner (optional): `julia_container/clean_html_docker.jl`
-  - Consumes a Redis queue and round-trips HTML from S3, cleaning it.
-  - Utilizes Julia multi-threading to process batch items in parallel. Control threads via `JULIA_NUM_THREADS` (default: `auto`).
+  - Discovers JSONL inputs in S3, submits to the OpenAI Batch API, tracks job IDs in Redis, polls until completion, downloads output files, and upserts into Postgres (`council_members`).
+  - Also supports direct messages on `json_to_db_queue` for manual/legacy ingestion (bypasses batch).
+- Julia cleaner: `julia_container/clean_html_docker.jl`
+  - Consumes `html_processing_queue` with S3 keys, downloads HTML, removes `<script>` tags, and generates JSONL request batches to S3 under `openai_batches/` (configurable).
+  - Attaches metadata (`source_bucket`, `source_key`, `cleaned_bucket`, `jsonl_bucket`) and sets `custom_id` based on the original filename.
+  - Utilizes Julia multi-threading; control threads via `JULIA_NUM_THREADS` (default: `auto`).
 - Docker/Compose: `Dockerfile`, `docker-compose.yml`
   - Worker image bundles Tailscale (optional), Vector installer, and runs the Rust binary.
 - Logging sidecar: `vector` service using `src/vector.toml`, forwards JSON logs to Redis.
@@ -44,15 +49,13 @@ rust_crawler — Distributed Web Crawler Pipeline
   - `politeness_delay_ms`: base delay per host (robots.txt delay may extend this)
   - `concurrent_tasks`: number of worker tasks to spawn
   - `keywords`: if a URL contains any, also upload the raw HTML to S3
-- Env file for Compose: `.env`
-  - `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `S3_BUCKET`
-  - `TS_AUTHKEY` (required if using Tailscale in the worker container)
-  - Optional S3-compatible settings: `AWS_ENDPOINT_URL`, `AWS_ALLOW_HTTP`
-  - Redis endpoints/keys: `REDIS_URL`, `REDIS_HOST`, `URL_QUEUE_KEY`, `VISITED_SET_KEY`
-  - Queue wiring: `HTML_PROCESSING_QUEUE`, `CLEANED_HTML_NEXT_QUEUE`, `DB_WRITER_QUEUE`
-  - Consumer tuning: `REDIS_BATCH_SIZE` (default 5)
-  - Log forwarder target: `REDIS_LOG_ENDPOINT` (e.g. `redis://<host_or_ip>:6379/`), `REDIS_LOG_KEY` (e.g. `crawler:logs`)
-  - Testing: `SAVE_ALL_HTML=true` to persist HTML for every crawled page
+- Environment files
+  - Root `.env` controls the Rust worker stack (see root `docker-compose.yml`).
+  - `julia_container/.env` controls the Julia cleaner (S3/Redis and OpenAI request template settings: `S3_SOURCE_BUCKET`, `S3_DESTINATION_BUCKET`, `S3_JSONL_BUCKET`, `AWS_*`, `REDIS_*`, `OPENAI_MODEL`, `OPENAI_API_ENDPOINT`).
+  - `python_container/.env` controls the DB writer (DB, Redis, S3 JSONL settings and OpenAI batch controls: `S3_JSONL_BUCKET`, `S3_JSONL_PREFIX`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_BATCH_*`).
+  - Optional S3-compatible settings: `AWS_ENDPOINT_URL`, `AWS_ALLOW_HTTP`.
+  - Log forwarder target: `REDIS_LOG_ENDPOINT` (e.g. `redis://<host_or_ip>:6379/`), `REDIS_LOG_KEY` (e.g. `crawler:logs`).
+  - Testing: `SAVE_ALL_HTML=true` to persist HTML for every crawled page in the Rust worker.
 - Proxies file: `proxies.txt`
   - Format per line: `host:port:user:pass`
   - If file is empty/invalid, worker falls back to a direct client.
@@ -78,26 +81,35 @@ rust_crawler — Distributed Web Crawler Pipeline
 **What the Worker Writes**
 - Crawl metadata (JSON) to S3 under `crawl-data/<uuid>.json` with fields:
   - `source_url`, `depth`, `scraped_at`, `found_links`
-- Raw HTML to S3 under `crawl-html/<sanitized>.html` for URLs matching configured keywords (case-insensitive). Set `SAVE_ALL_HTML=true` to save HTML for all pages (useful for testing MinIO/S3 setup).
+- Raw HTML to S3 under `crawl-html/<sanitized>.html` for URLs matching configured keywords (case-insensitive). Set `SAVE_ALL_HTML=true` to save HTML for all pages.
+- The Julia cleaner converts S3 HTML keys into JSONL requests and uploads them under `openai_batches/` in `S3_JSONL_BUCKET`.
 
-**Running the Python DB Writer**
-- Navigate to `python_container/`.
-- Configure `.env` with:
-  - `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`
-  - `REDIS_QUEUE_NAME` (default: `json_to_db_queue`)
-  - `REDIS_BATCH_SIZE` (default: 5)
+**Running the Python DB Writer (Batch mode)**
+- Navigate to `python_container/` and configure `.env`:
+  - Database/Redis: `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `DATABASE_URL` (optional override), `REDIS_HOST`, `REDIS_PORT`, `REDIS_QUEUE_NAME`
+  - S3 JSONL inputs: `S3_JSONL_BUCKET`, `S3_JSONL_PREFIX` (default `openai_batches/`), plus `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL` (for MinIO)
+  - OpenAI: `OPENAI_API_KEY`, `OPENAI_BASE_URL` (optional for compatible gateways)
+  - Batch control: `OPENAI_BATCH_COMPLETION_WINDOW`, `OPENAI_BATCH_POLL_INTERVAL`, `OPENAI_BATCH_SUBMIT_INTERVAL`, `OPENAI_BATCH_AUTO_DISCOVER`, `OPENAI_BATCH_INPUT_LIMIT`
 - Start services:
   - `docker compose --env-file .env up -d`
 - Ensure a `council_members` table exists (example schema):
-  - Columns: `unique_key` (PK, text), `full_name` (text), `party` (text), `municipality` (text),
-    `roles` (jsonb), `source_file` (text), `raw_json` (jsonb), `updated_at` (timestamptz default now())
-- Push a test message to the queue to verify upsert path:
-  - `redis-cli -h 127.0.0.1 -p 6379 LPUSH json_to_db_queue '{"name":"Max Muster","municipality":"Musterstadt","party":"ABC","roles":["Rat"],"source_file":"file.html"}'`
+  - Columns: `unique_key` (PK, text), `full_name` (text), `party` (text), `municipality` (text), `roles` (jsonb), `source_file` (text), `raw_json` (jsonb), `updated_at` (timestamptz default now())
+- Operation:
+  - The worker auto-discovers new JSONL files in `s3://$S3_JSONL_BUCKET/$S3_JSONL_PREFIX`, submits OpenAI batch jobs, polls for completion, downloads output files, and upserts one row per JSONL output line.
+  - It also accepts direct messages on `json_to_db_queue` for legacy/manual ingestion.
+  - Each row contains `municipality` and `source_file` so you can correlate entries to specific Kommunen and source pages.
+  - If the LLM omits a municipality, the worker can fall back to request metadata (see “Julia Cleaner and JSONL” below).
 
-**Optional: Julia Cleaner**
+**Julia Cleaner and JSONL**
 - Files: `julia_container/`
-- Ensure the Dockerfile `CMD` matches the actual script (provided script: `clean_html_docker.jl`).
-- Provide AWS/Redis envs as in `julia_container/docker-compose.yml`.
+- The cleaner consumes `html_processing_queue` (S3 keys), downloads HTML, removes `<script>` tags, and constructs OpenAI batch JSONL lines:
+  - `custom_id` is derived from the HTML filename for stable traceability.
+  - `metadata` includes `source_bucket`, `source_key`, `cleaned_bucket`, and `jsonl_bucket`. You can optionally add a municipality hint if derivable from path/domain.
+- Uploads the batch JSONL to `s3://$S3_JSONL_BUCKET/openai_batches/batch_<timestamp>_<rand>.jsonl` by default.
+- Configure via `julia_container/.env`:
+  - `S3_SOURCE_BUCKET`, `S3_DESTINATION_BUCKET`, `S3_JSONL_BUCKET`, `AWS_REGION`, `AWS_ENDPOINT_URL`, `AWS_ALLOW_HTTP`
+  - `REDIS_HOST`, `REDIS_PORT`, `REDIS_QUEUE_NAME`
+  - `OPENAI_MODEL`, `OPENAI_API_ENDPOINT`
 
 **Local Development (without Docker)**
 - Requirements: Rust toolchain, Redis running locally, AWS credentials in env.
@@ -108,8 +120,9 @@ rust_crawler — Distributed Web Crawler Pipeline
 **Queues and Keys**
 - `crawler:url_queue` — main URL queue (override via `url_queue_key` in `worker_config.toml` or `URL_QUEUE_KEY` env)
 - `crawler:visited_set` — dedup set for seen URLs (`visited_set_key` / `VISITED_SET_KEY`)
-- `html_processing_queue` — cleaned HTML fan-out to Julia (`HTML_PROCESSING_QUEUE`)
-- `json_to_db_queue` — Python DB writer input (`DB_WRITER_QUEUE` or `REDIS_QUEUE_NAME`)
+- `html_processing_queue` — S3 HTML keys for Julia (`HTML_PROCESSING_QUEUE`)
+- `json_to_db_queue` — optional direct input to DB writer (bypasses batch)
+- S3 JSONL prefix — `s3://$S3_JSONL_BUCKET/$S3_JSONL_PREFIX` (default `openai_batches/`)
 
 **Troubleshooting**
 - Redis connection errors inside the worker container:
@@ -288,6 +301,7 @@ flowchart LR
   end
 
   DBW[DB Writer Container]
+  OA[OpenAI Batch API]
 
   %% Queues and crawl flow
   W1 -->|url_queue / visited_set| R
@@ -299,11 +313,15 @@ flowchart LR
   WN -->|HTML + metadata| S3
 
   R -->|html_processing_queue| J
-  J -->|cleaned HTML| S3
+  J -->|JSONL batches| S3
 
-  R -->|json_to_db_queue| DBW
-  DBW -->|fetch cleaned HTML| S3
+  DBW -->|discover JSONL| S3
+  DBW -->|submit| OA
+  OA  -->|output files| DBW
   DBW -->|upserts| PG
+
+  %% Optional direct path
+  R -->|json_to_db_queue (optional)| DBW
 
   %% Centralized logging
   W1 -.->|Vector → Loki| L
@@ -319,8 +337,8 @@ flowchart LR
 
 Legend
 - Each VM runs a Vector agent that tails Docker logs and forwards them to Loki on the central host (`LOKI_ENDPOINT=http://<central_host_ip>:3100`). Ensure every VM starts its `vector` service.
-- Redis lives on the central host and is shared by all workers. Workers read/write `url_queue` and `visited_set`; Julia consumes `html_processing_queue`; Python DB writer consumes `json_to_db_queue`.
-- S3/MinIO stores raw and cleaned HTML plus crawl metadata. The DB writer fetches cleaned HTML from S3 and writes structured rows to Postgres.
+- Redis lives on the central host and is shared by all workers. Workers read/write `url_queue` and `visited_set`; Julia consumes `html_processing_queue` and emits JSONL to S3; Python DB writer discovers JSONL, manages OpenAI batch jobs, and writes results to Postgres. The `json_to_db_queue` remains available for direct/legacy ingestion.
+- S3/MinIO stores raw HTML, JSONL batch inputs, and crawl metadata.
 - Grafana queries Loki for centralized viewing and search of logs.
 
 ## Docker Command Reference
@@ -354,8 +372,12 @@ docker stop julia-cleaner && docker rm julia-cleaner
 # Build
 docker build -t crawler-db-writer -f python_container/dockerfile python_container
 
-# Run (requires python_container/.env with database/Redis settings)
+# Run (requires python_container/.env with DB/Redis and Batch settings)
 docker run -d --name crawler-db-writer --env-file python_container/.env crawler-db-writer
+
+# Required in python_container/.env for batch mode:
+# - OPENAI_API_KEY
+# - S3_JSONL_BUCKET (and optionally S3_JSONL_PREFIX)
 
 # Stop and remove
 docker stop crawler-db-writer && docker rm crawler-db-writer
@@ -369,3 +391,54 @@ docker run -d --name crawler-redis -p 6379:6379 redis:6
 # Stop and remove
 docker stop crawler-redis && docker rm crawler-redis
 ```
+
+## End-to-End Flow (Checklist)
+
+1) Configure environment files
+- Root `.env` for the Rust worker stack (S3 creds/bucket, Redis, optional `AWS_ENDPOINT_URL`, `AWS_ALLOW_HTTP`).
+- `julia_container/.env`:
+  - `AWS_*`, `S3_SOURCE_BUCKET`, `S3_DESTINATION_BUCKET`, `S3_JSONL_BUCKET`
+  - `REDIS_HOST`, `REDIS_PORT`, `REDIS_QUEUE_NAME=html_processing_queue`
+  - `OPENAI_MODEL`, `OPENAI_API_ENDPOINT` (used only for JSONL request template)
+- `python_container/.env`:
+  - DB/Redis: `POSTGRES_*` or `DATABASE_URL`, `REDIS_HOST`, `REDIS_PORT`, `REDIS_QUEUE_NAME`
+  - S3 JSONL input: `S3_JSONL_BUCKET`, `S3_JSONL_PREFIX` (default `openai_batches/`), `AWS_*`
+  - OpenAI Batch: `OPENAI_API_KEY`, optionally `OPENAI_BASE_URL`, and cadence vars `OPENAI_BATCH_*`
+
+2) Start core services
+- Central logging stack (optional, from repo root): `docker compose -f compose-docker.yml up -d`
+- Redis (if not using the central stack): `docker run -d --name crawler-redis -p 6379:6379 redis:6`
+
+3) Start the Rust crawler
+- From repo root: `docker compose up -d worker`
+- Verify it enqueues S3 HTML keys to `html_processing_queue` and writes HTML to S3 (watch `docker compose logs -f worker`).
+
+4) Start the Julia cleaner
+- From `julia_container/`: `docker compose --env-file .env up -d`
+- Verify logs show JSONL batches uploaded to `s3://$S3_JSONL_BUCKET/$S3_JSONL_PREFIX` (default `openai_batches/`).
+
+5) Start the Python DB writer (batch manager)
+- From `python_container/`: `docker compose --env-file .env up -d db-writer`
+- Confirm logs show batch submission (OpenAI job IDs recorded), polling, and completion, followed by output file ingestion.
+
+6) Verify data in Postgres
+- Example queries:
+```sql
+SELECT municipality, count(*) FROM council_members GROUP BY municipality ORDER BY count DESC;
+SELECT full_name, party, roles, source_file FROM council_members WHERE municipality = 'Musterstadt' ORDER BY full_name;
+```
+
+7) Quick pipeline smoke test options
+- Push a direct JSON test to bypass batch (legacy path):
+  `redis-cli -h <redis_host> -p 6379 LPUSH json_to_db_queue '{"name":"Max Muster","gemeinde":"Musterstadt","partei":"ABC","rollen":["Rat"],"quelle":"datei.html"}'`
+- Or push one S3 HTML key to kick Julia → JSONL → Batch path:
+  `redis-cli -h <redis_host> -p 6379 LPUSH html_processing_queue 'crawl-html/example.html'` (ensure the object exists in `S3_SOURCE_BUCKET`).
+
+8) Observability
+- Vector logs to Loki: `docker compose -f docker-compose.vector.yml logs -f vector` (on each VM) and explore in Grafana.
+- Service logs: `docker compose logs -f worker`, `docker compose -f julia_container/docker-compose.yml logs -f`, `docker compose -f python_container/docker-compose.yml logs -f db-writer`.
+
+9) Common pitfalls
+- Buckets/prefixes must exist; `S3_JSONL_BUCKET` must be readable by the DB writer.
+- When using MinIO, set `AWS_ENDPOINT_URL` and allow HTTP with `AWS_ALLOW_HTTP=true` where applicable.
+- Ensure `OPENAI_API_KEY` is set for the DB writer; without it, batch submission will fail.

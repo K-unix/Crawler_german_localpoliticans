@@ -9,6 +9,9 @@ using Printf
 using Logging
 using Dates
 using Base.Threads
+using Base: basename
+using JSON
+using Random
 
 const CONSOLE_LOGGER = ConsoleLogger(stdout)
 global_logger(CONSOLE_LOGGER)
@@ -27,6 +30,10 @@ end
 const CONFIG = (
     S3_SOURCE_BUCKET      = get_env_var("S3_SOURCE_BUCKET"),
     S3_DESTINATION_BUCKET = get_env_var("S3_DESTINATION_BUCKET"),
+    S3_JSONL_BUCKET       = begin
+        dest = get_env_var("S3_DESTINATION_BUCKET")
+        get_env_var("S3_JSONL_BUCKET", dest)
+    end,
     AWS_REGION            = get_env_var("AWS_REGION", "us-east-1"),
     AWS_ACCESS_KEY_ID     = get_env_var("AWS_ACCESS_KEY_ID"),
     AWS_SECRET_ACCESS_KEY = get_env_var("AWS_SECRET_ACCESS_KEY"),
@@ -36,12 +43,14 @@ const CONFIG = (
     REDIS_HOST            = get_env_var("REDIS_HOST", "redis"),
     REDIS_PORT            = parse(Int, get_env_var("REDIS_PORT", "6379")),
     REDIS_QUEUE_NAME      = get_env_var("REDIS_QUEUE_NAME", "html_processing_queue"),
-    # --- NEW: Configuration for the next queue in the pipeline ---
-    REDIS_NEXT_QUEUE_NAME = get_env_var("REDIS_NEXT_QUEUE_NAME", ""), # Defaults to empty string
-    REDIS_LOG_LIST        = get_env_var("REDIS_LOG_LIST", "")
+    REDIS_LOG_LIST        = get_env_var("REDIS_LOG_LIST", ""),
+    OPENAI_MODEL          = get_env_var("OPENAI_MODEL", "gpt-4-turbo"),
+    OPENAI_API_ENDPOINT   = get_env_var("OPENAI_API_ENDPOINT", "/v1/chat/completions")
 )
 
 const BATCH_SIZE = 20
+const OPENAI_SYSTEM_MESSAGE = "You are a helpful assistant that analyzes HTML content."
+const OPENAI_USER_PREFIX = "Analyze the following HTML document: \n\n"
 
 @info "Julia threading configured." threads=nthreads()
 
@@ -203,9 +212,9 @@ function minio_get_object(client::MinioClient, bucket::AbstractString, key::Abst
     response.body
 end
 
-function minio_put_object(client::MinioClient, bucket::AbstractString, key::AbstractString, body::AbstractString)
+function minio_put_object(client::MinioClient, bucket::AbstractString, key::AbstractString, body::AbstractString; content_type::String="application/octet-stream")
     bytes = Vector{UInt8}(codeunits(body))
-    minio_signed_request(client, "PUT", bucket, key; body=bytes, content_type="text/html; charset=utf-8")
+    minio_signed_request(client, "PUT", bucket, key; body=bytes, content_type=content_type)
     nothing
 end
 
@@ -309,9 +318,61 @@ function clean_html_content(html_content::String)::String
     end
 end
 
+function read_body_bytes(body)::Vector{UInt8}
+    if body isa AbstractVector{UInt8}
+        return Vector{UInt8}(body)
+    end
+
+    data = if hasmethod(take!, Tuple{typeof(body)})
+        take!(body)
+    elseif hasmethod(read, Tuple{typeof(body)})
+        read(body)
+    else
+        error("Unsupported body type $(typeof(body)) for byte conversion")
+    end
+
+    if hasmethod(close, Tuple{typeof(body)})
+        try
+            close(body)
+        catch
+            # best effort close; ignore failures
+        end
+    end
+
+    if data isa AbstractVector{UInt8}
+        return Vector{UInt8}(data)
+    elseif data isa AbstractString
+        return Vector{UInt8}(codeunits(data))
+    end
+
+    return Vector{UInt8}(codeunits(String(data)))
+end
+
+function object_to_string(obj)::String
+    if obj isa String
+        return obj
+    elseif obj isa AbstractVector{UInt8}
+        return String(Vector{UInt8}(obj))
+    elseif hasproperty(obj, :body)
+        return String(read_body_bytes(getproperty(obj, :body)))
+    elseif hasproperty(obj, :data)
+        return String(read_body_bytes(getproperty(obj, :data)))
+    end
+    error("Unsupported object type $(typeof(obj)) for string conversion")
+end
+
+function derive_custom_id(source_key::AbstractString)::String
+    filename = basename(source_key)
+    candidate = isempty(filename) ? source_key : filename
+    sanitized = replace(candidate, r"[^0-9A-Za-z_.-]" => "_")
+    sanitized = strip(sanitized, '_')
+    isempty(sanitized) && (sanitized = "file")
+    return string("request_", sanitized)
+end
+
 # --- MAIN WORKER FUNCTION ---
 function process_queue()
-    if isempty(CONFIG.S3_SOURCE_BUCKET) || isempty(CONFIG.S3_DESTINATION_BUCKET) || isempty(CONFIG.AWS_ACCESS_KEY_ID)
+    if isempty(CONFIG.S3_SOURCE_BUCKET) || isempty(CONFIG.S3_DESTINATION_BUCKET) || isempty(CONFIG.S3_JSONL_BUCKET) || isempty(CONFIG.AWS_ACCESS_KEY_ID)
         @error "Essential S3 configuration is missing."
         return
     end
@@ -323,17 +384,17 @@ function process_queue()
     allow_http = truthy(CONFIG.AWS_ALLOW_HTTP) || (!isempty(endpoint) && startswith(lowercase(endpoint), "http://"))
 
     download_html = nothing
-    upload_html = nothing
+    upload_object = nothing
 
     if isempty(endpoint)
         creds = session_token === nothing ? AWSCredentials(access_key, secret_key) : AWSCredentials(access_key, secret_key, session_token)
         aws_config = global_aws_config(creds=creds, region=CONFIG.AWS_REGION)
         download_html = (bucket::String, key::String) -> begin
             response = s3_get(bucket, key; aws_config=aws_config)
-            String(response)
+            object_to_string(response)
         end
-        upload_html = (bucket::String, key::String, content::String) -> begin
-            s3_put(bucket, key, content; aws_config=aws_config)
+        upload_object = (bucket::String, key::String, content::String, content_type::String) -> begin
+            s3_put(bucket, key, content; aws_config=aws_config, content_type=content_type)
             nothing
         end
         @info "Using AWS S3 backend"
@@ -346,10 +407,10 @@ function process_queue()
         end
         download_html = (bucket::String, key::String) -> begin
             bytes = minio_get_object(minio_client, bucket, key)
-            String(bytes)
+            object_to_string(bytes)
         end
-        upload_html = (bucket::String, key::String, content::String) -> begin
-            minio_put_object(minio_client, bucket, key, content)
+        upload_object = (bucket::String, key::String, content::String, content_type::String) -> begin
+            minio_put_object(minio_client, bucket, key, content; content_type=content_type)
             nothing
         end
         @info "Using custom S3 endpoint" endpoint=endpoint host=minio_client.host_header
@@ -369,9 +430,6 @@ function process_queue()
     setup_redis_logging()
 
     @info "Worker started." queue=CONFIG.REDIS_QUEUE_NAME
-    if !isempty(CONFIG.REDIS_NEXT_QUEUE_NAME)
-        @info "Next queue configured." next_queue=CONFIG.REDIS_NEXT_QUEUE_NAME
-    end
 
     queue_name = CONFIG.REDIS_QUEUE_NAME
 
@@ -391,7 +449,12 @@ function process_queue()
             continue
         end
 
-    @info "Processing batch." batch_size=length(batch)
+        @info "Processing batch." batch_size=length(batch)
+
+        json_lines = Vector{Union{Nothing,String}}(undef, length(batch))
+        for i in eachindex(json_lines)
+            json_lines[i] = nothing
+        end
 
         @threads for i in eachindex(batch)
             source_key = batch[i]
@@ -403,39 +466,80 @@ function process_queue()
                     download_html(CONFIG.S3_SOURCE_BUCKET, source_key)
                 catch err
                     @error "Failed to download source object." bucket=CONFIG.S3_SOURCE_BUCKET key=source_key exception=(err, catch_backtrace())
+                    json_lines[i] = nothing
                     continue
                 end
 
                 cleaned_html = clean_html_content(html_content)
 
-                @info "Uploading cleaned HTML to S3." bucket=CONFIG.S3_DESTINATION_BUCKET key=source_key
-                try
-                    upload_html(CONFIG.S3_DESTINATION_BUCKET, source_key, cleaned_html)
-                    @info "Upload complete." key=source_key
-                catch err
-                    @error "Failed to upload cleaned HTML." bucket=CONFIG.S3_DESTINATION_BUCKET key=source_key exception=(err, catch_backtrace())
-                    continue
-                end
+                custom_id = derive_custom_id(source_key)
+                user_message = string(OPENAI_USER_PREFIX, cleaned_html)
 
-                if !isempty(CONFIG.REDIS_NEXT_QUEUE_NAME)
-                    @info "Forwarding task to next queue." next_queue=CONFIG.REDIS_NEXT_QUEUE_NAME key=source_key
-                    try
-                        local_conn = Redis.RedisConnection(host=CONFIG.REDIS_HOST, port=CONFIG.REDIS_PORT)
-                        Redis.lpush(local_conn, CONFIG.REDIS_NEXT_QUEUE_NAME, source_key)
-                        try
-                            close(local_conn)
-                        catch
-                            # ignore close errors
-                        end
-                        @info "Task forwarded successfully." key=source_key
-                    catch ferr
-                        @error "Failed to forward task to next queue." next_queue=CONFIG.REDIS_NEXT_QUEUE_NAME key=source_key exception=(ferr, catch_backtrace())
-                    end
-                end
+                request_obj = Dict(
+                    "custom_id" => custom_id,
+                    "method" => "POST",
+                    "url" => CONFIG.OPENAI_API_ENDPOINT,
+                    "body" => Dict(
+                        "model" => CONFIG.OPENAI_MODEL,
+                        "messages" => Any[
+                            Dict("role" => "system", "content" => OPENAI_SYSTEM_MESSAGE),
+                            Dict("role" => "user", "content" => user_message)
+                        ],
+                        "max_tokens" => 2048,
+                    ),
+                    "metadata" => Dict(
+                        "source_bucket" => CONFIG.S3_SOURCE_BUCKET,
+                        "source_key" => source_key,
+                        "cleaned_bucket" => CONFIG.S3_DESTINATION_BUCKET,
+                        "jsonl_bucket" => CONFIG.S3_JSONL_BUCKET,
+                    ),
+                )
 
-                @info "Job completed successfully." key=source_key
+                json_lines[i] = JSON.json(request_obj; canonical=true)
+                @info "Prepared JSONL entry." key=source_key custom_id=custom_id
             catch e
+                json_lines[i] = nothing
                 @error "An error occurred during job processing." key=source_key exception=(e, catch_backtrace())
+            end
+        end
+
+        valid_lines = String[]
+        for line in json_lines
+            if line !== nothing
+                push!(valid_lines, line::String)
+            end
+        end
+
+        if isempty(valid_lines)
+            @warn "No valid JSON lines produced for batch; skipping upload." batch_size=length(batch)
+            @info "Waiting for next job..." batch_size=length(batch)
+            continue
+        end
+
+        timestamp = Dates.format(Dates.now(Dates.UTC), dateformat"yyyymmddHHMMSS")
+        random_suffix = randstring(6)
+        filename = string("batch_", timestamp, "_", random_suffix, ".jsonl")
+        object_key = string("openai_batches/", filename)
+        temp_path = tempname()
+
+        try
+            open(temp_path, "w") do io
+                for line in valid_lines
+                    write(io, line)
+                    write(io, '\n')
+                end
+            end
+
+            jsonl_content = read(temp_path, String)
+            upload_object(CONFIG.S3_JSONL_BUCKET, object_key, jsonl_content, "application/json")
+            @info "Uploaded batch JSONL." bucket=CONFIG.S3_JSONL_BUCKET key=object_key lines=length(valid_lines)
+        catch err
+            @error "Failed to upload JSONL batch." bucket=CONFIG.S3_JSONL_BUCKET key=object_key exception=(err, catch_backtrace())
+        finally
+            try
+                rm(temp_path; force=true)
+            catch cleanup_err
+                @warn "Failed to remove temporary file." path=temp_path exception=(cleanup_err, catch_backtrace())
             end
         end
 

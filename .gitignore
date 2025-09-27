@@ -9,3 +9,4 @@ tmp_depot/
 process_html/
 Erste_10_Zeilen__Vorschau_.csv
 .env
+.DS_Store
