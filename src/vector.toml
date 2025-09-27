@@ -1,0 +1,36 @@
+## Source: Tail Docker container logs via the Docker Engine API
+[sources.docker_logs]
+  type = "docker_logs"
+  docker_host = "unix:///var/run/docker.sock"
+  include_labels = ["com.rustcrawler.logs=true"]
+
+## Transform: Parse JSON log payload from the "message" field
+[transforms.parse_json]
+  inputs = ["docker_logs"]
+  type = "json_parser"
+  source = "message"
+  
+## Sink: Keep console output for quick debugging
+[sinks.output_to_console]
+  inputs = ["parse_json"]
+  type = "console"
+  encoding.codec = "json"
+
+[sinks.redis_logs]
+  inputs = ["parse_json"]
+  type = "redis"
+  endpoint = "{{ env_var(\"REDIS_LOG_ENDPOINT\") }}"
+  key = "{{ env_var(\"REDIS_LOG_KEY\") }}"
+  data_type = "list"
+  encoding.codec = "json"
+
+[sinks.loki]
+  inputs = ["parse_json"]
+  type = "loki"
+  endpoint = "{{ env_var(\"LOKI_ENDPOINT\") }}"
+  encoding.codec = "json"
+  batch.max_bytes = 10485760
+  labels.project = "rust_crawler"
+  labels.container = "{{ container_name }}"
+  labels.service = "{{ labels.com_rustcrawler_service | default(container_name) }}"
+  labels.level = "{{ level | default(\"info\") }}"

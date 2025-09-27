@@ -1,0 +1,18 @@
+# Use an official Julia base image
+FROM julia:1.10
+
+# Set the working directory inside the container
+WORKDIR /app
+
+# Enable multi-threading by default (can be overridden at runtime)
+ENV JULIA_NUM_THREADS=auto
+
+# Pre-install Julia packages to leverage Docker layer caching.
+# This step only re-runs if the package list changes.
+RUN julia -e 'using Pkg; Pkg.add(["Gumbo", "AbstractTrees", "Redis", "AWS", "AWSS3", "HTTP"]);'
+
+# Copy the worker script into the container
+COPY clean_html_docker.jl .
+
+# Command to run when the container starts
+CMD ["julia", "clean_html_docker.jl"]

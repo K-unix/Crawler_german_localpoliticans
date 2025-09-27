@@ -1,0 +1,15 @@
+services:
+  vector:
+    image: timberio/vector:latest-alpine
+    container_name: crawler-vector
+    environment:
+      - REDIS_LOG_ENDPOINT=${REDIS_LOG_ENDPOINT}
+      - REDIS_LOG_KEY=${REDIS_LOG_KEY}
+      - LOKI_ENDPOINT=${LOKI_ENDPOINT}
+    volumes:
+      - ./src/vector.toml:/etc/vector/vector.toml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    labels:
+      - com.rustcrawler.logs=true
+      - com.rustcrawler_service=vector
+    restart: unless-stopped

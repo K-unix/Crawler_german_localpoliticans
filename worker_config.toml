@@ -1,0 +1,34 @@
+# worker_config.toml
+
+# Redis server address
+redis_url = "redis://100.123.122.55:6379/"
+
+# Redis keys for coordinating crawl work
+url_queue_key = "crawler:url_queue"
+visited_set_key = "crawler:visited_set"
+
+# S3 bucket for storing results
+s3_bucket = "test-data"
+
+# Path to the proxy file
+proxy_file = "proxies.txt"
+
+# Maximum crawl depth. URLs found at this depth will not have their links queued.
+max_depth = 2
+
+# General politeness delay to add between requests to any host
+# (Note: robots.txt Crawl-delay will still be respected if it's longer)
+politeness_delay_ms = 2000
+
+#Number of workers
+concurrent_tasks = 4
+
+# Keywords to look for in URLs. If found, the full HTML might be saved.
+# (This part of the logic is not yet in the worker, but the config is here)
+keywords = [
+    "Gemeinderat",
+    "Stadtrat",
+    "Bürgermeister",
+    "Rathaus",
+    "Landrat",
+]

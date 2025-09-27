@@ -1,0 +1,22 @@
+# docker-compose.yml — worker service only
+
+services:
+  worker:
+    build: .
+    container_name: crawler-worker
+    network_mode: "host"
+    environment:
+      - AWS_REGION=${AWS_REGION}
+      - TZ=Europe/Berlin
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - S3_BUCKET=${S3_BUCKET}
+      - TS_AUTHKEY
+      - DISABLE_TAILSCALE=true
+      - AWS_ENDPOINT_URL=${AWS_ENDPOINT_URL}
+      - AWS_ALLOW_HTTP=${AWS_ALLOW_HTTP}
+      - ALLOW_INSECURE_PROXY_TLS=1
+      - RUST_LOG=info
+    labels:
+      - com.rustcrawler.logs=true
+      - com.rustcrawler_service=worker

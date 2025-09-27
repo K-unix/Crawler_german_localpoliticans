@@ -1,0 +1,47 @@
+services:
+  # Redis server (central message bus and log list storage)
+  redis:
+    image: redis:7-alpine
+    container_name: rc-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    restart: unless-stopped
+
+  # Loki log store (receives logs from Vector via HTTP)
+  loki:
+    image: grafana/loki:2.9.8
+    container_name: rc-loki
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki-data:/loki
+    restart: unless-stopped
+
+  # Vector collector (tails Docker logs and forwards to Redis + Loki)
+  vector:
+    image: timberio/vector:latest-alpine
+    container_name: rc-vector
+    depends_on:
+      - redis
+      - loki
+    environment:
+      # Explicit internal service endpoints for this stack
+      - REDIS_LOG_ENDPOINT=redis://redis:6379/
+      - REDIS_LOG_KEY=${REDIS_LOG_KEY:-crawler:logs}
+      - LOKI_ENDPOINT=http://loki:3100
+    volumes:
+      - ./src/vector.toml:/etc/vector/vector.toml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    labels:
+      - com.rustcrawler.logs=true
+      - com.rustcrawler_service=vector
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  loki-data:
+

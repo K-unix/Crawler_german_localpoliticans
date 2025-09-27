@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  db-writer:
+    build: .
+    depends_on:
+      - db
+      - vector
+    environment:
+      # The DATABASE_URL is constructed from other variables
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      
+      # These variables connect to the other services
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_QUEUE_NAME=${REDIS_QUEUE_NAME}
+    labels:
+      - com.rustcrawler.logs=true
+      - com.rustcrawler_service=db_writer
+    restart: unless-stopped
+
+  vector:
+    image: timberio/vector:latest-alpine
+    depends_on:
+      - db
+    environment:
+      - LOKI_ENDPOINT=${LOKI_ENDPOINT:-http://localhost:3100}
+      - REDIS_LOG_ENDPOINT=${REDIS_LOG_ENDPOINT:-redis://localhost:6379/}
+      - REDIS_LOG_KEY=${REDIS_LOG_KEY:-crawler:logs}
+    volumes:
+      - ../src/vector.toml:/etc/vector/vector.toml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    labels:
+      - com.rustcrawler.logs=true
+      - com.rustcrawler_service=vector
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

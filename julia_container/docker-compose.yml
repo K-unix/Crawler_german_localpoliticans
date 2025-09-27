@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  # The Julia worker service
+  worker:
+    build: . # Build the image from the Dockerfile in the current directory
+    environment:
+      - JULIA_NUM_THREADS=auto
+      # --- REQUIRED: FILL THESE IN ---
+      - AWS_ACCESS_KEY_ID=YOUR_AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY=YOUR_AWS_SECRET_ACCESS_KEY
+      - S3_SOURCE_BUCKET=your-source-html-bucket
+      - S3_DESTINATION_BUCKET=your-cleaned-html-bucket
+
+      # --- OPTIONAL: These have sensible defaults ---
+      - AWS_REGION=us-east-1
+      - REDIS_HOST=redis  # Use the service name to connect
+      - REDIS_PORT=6379
+      - REDIS_QUEUE_NAME=html_processing_queue
+    restart: unless-stopped
+
+volumes:
+  redis_data:
