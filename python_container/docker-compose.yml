@@ -21,6 +21,7 @@ services:
     environment:
       # The DATABASE_URL is constructed from other variables
       - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      - WORKER_MODE=${WORKER_MODE:-db_writer}
       
       # These variables connect to the other services
       - REDIS_HOST=${REDIS_HOST}

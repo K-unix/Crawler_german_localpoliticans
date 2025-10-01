@@ -59,7 +59,7 @@ services:
       - DATABASE_URL=${CRAWLER_DATABASE_URL:-postgresql://${POSTGRES_USER:-rustcrawler}:${POSTGRES_PASSWORD:-rustcrawler}@postgres:5432/${POSTGRES_DB:-rustcrawler}}
       - INGEST_POLL_INTERVAL_SECONDS=${INGEST_POLL_INTERVAL_SECONDS:-30}
       - REDIS_URL=${REDIS_URL}
-    command: ["python", "crawler_ingest.py"]
+      - WORKER_MODE=crawler_ingest
     restart: unless-stopped
 
 volumes:
