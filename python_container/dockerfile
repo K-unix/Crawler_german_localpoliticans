@@ -8,9 +8,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the worker script into the container
-COPY db_writer.py .
+# Copy application source
+COPY . .
 
-# Command to run when the container starts
+# Command to run when the container starts by default
 CMD ["python", "db_writer.py"]
-

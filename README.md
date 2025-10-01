@@ -26,6 +26,9 @@ rust_crawler — Distributed Web Crawler Pipeline
 - Python DB writer: `python_container/db_writer.py`
   - Discovers JSONL inputs in S3, submits to the OpenAI Batch API, tracks job IDs in Redis, polls until completion, downloads output files, and upserts into Postgres (`council_members`).
   - Also supports direct messages on `json_to_db_queue` for manual/legacy ingestion (bypasses batch).
+- Crawler ingestor: `python_container/crawler_ingest.py`
+  - Polls `crawl-data/` objects in S3, normalises URLs, persists crawl metadata and discovered links into Postgres, and tracks raw HTML artefacts.
+  - Runs as `crawler-ingestor` in the root compose stack (shares the Python worker image).
 - Julia cleaner: `julia_container/clean_html_docker.jl`
   - Consumes `html_processing_queue` with S3 keys, downloads HTML, removes `<script>` tags, and generates JSONL request batches to S3 under `openai_batches/` (configurable).
   - Attaches metadata (`source_bucket`, `source_key`, `cleaned_bucket`, `jsonl_bucket`) and sets `custom_id` based on the original filename.
@@ -53,6 +56,7 @@ rust_crawler — Distributed Web Crawler Pipeline
   - Root `.env` controls the Rust worker stack (see root `docker-compose.yml`).
   - `julia_container/.env` controls the Julia cleaner (S3/Redis and OpenAI request template settings: `S3_SOURCE_BUCKET`, `S3_DESTINATION_BUCKET`, `S3_JSONL_BUCKET`, `AWS_*`, `REDIS_*`, `OPENAI_MODEL`, `OPENAI_API_ENDPOINT`).
   - `python_container/.env` controls the DB writer (DB, Redis, S3 JSONL settings and OpenAI batch controls: `S3_JSONL_BUCKET`, `S3_JSONL_PREFIX`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_BATCH_*`).
+  - `CRAWLER_DATABASE_URL` must point at your PostgreSQL server (e.g. `postgresql://user:pass@192.168.1.10:5432/rustcrawler`) when running the `crawler_ingestor` service.
   - Optional S3-compatible settings: `AWS_ENDPOINT_URL`, `AWS_ALLOW_HTTP`.
   - Log forwarder target: `REDIS_LOG_ENDPOINT` (e.g. `redis://<host_or_ip>:6379/`), `REDIS_LOG_KEY` (e.g. `crawler:logs`).
   - Testing: `SAVE_ALL_HTML=true` to persist HTML for every crawled page in the Rust worker.
@@ -68,6 +72,8 @@ rust_crawler — Distributed Web Crawler Pipeline
   - If you have a valid Tailscale auth key, set `TS_AUTHKEY` in `.env`.
   - Build and run the worker (Vector starts automatically via `depends_on`):
     - `docker compose up --build worker`
+  - Start the local Postgres + crawler ingest loop:
+    - `docker compose up -d postgres crawler-ingestor`
   - Without Tailscale (local testing), bypass the entrypoint:
     - `docker compose run --rm --no-deps --entrypoint rust_crawler worker`
 
