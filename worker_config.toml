@@ -1,7 +1,7 @@
 # worker_config.toml
 
 # Redis server address
-redis_url = "redis://100.123.122.55:6379/"
+redis_url = "redis:///"
 
 # Redis keys for coordinating crawl work
 url_queue_key = "crawler:url_queue"
