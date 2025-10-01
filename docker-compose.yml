@@ -1,24 +1,6 @@
 # docker-compose.yml — worker service only
 
 services:
-  postgres:
-    image: postgres:15
-    container_name: crawler-postgres
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:-rustcrawler}
-      POSTGRES_USER: ${POSTGRES_USER:-rustcrawler}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rustcrawler}
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rustcrawler} -d ${POSTGRES_DB:-rustcrawler}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-
   worker:
     build: .
     container_name: crawler-worker
@@ -38,29 +20,3 @@ services:
     labels:
       - com.rustcrawler.logs=true
       - com.rustcrawler_service=worker
-
-  crawler-ingestor:
-    build:
-      context: ./python_container
-      dockerfile: dockerfile
-    container_name: crawler-ingestor
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      - AWS_REGION=${AWS_REGION}
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - AWS_ENDPOINT_URL=${AWS_ENDPOINT_URL}
-      - AWS_ALLOW_HTTP=${AWS_ALLOW_HTTP}
-      - S3_BUCKET=${S3_BUCKET}
-      - CRAWL_DATA_PREFIX=${CRAWL_DATA_PREFIX:-crawl-data/}
-      - CRAWL_HTML_PREFIX=${CRAWL_HTML_PREFIX:-crawl-html/}
-      - DATABASE_URL=${CRAWLER_DATABASE_URL:-postgresql://${POSTGRES_USER:-rustcrawler}:${POSTGRES_PASSWORD:-rustcrawler}@postgres:5432/${POSTGRES_DB:-rustcrawler}}
-      - INGEST_POLL_INTERVAL_SECONDS=${INGEST_POLL_INTERVAL_SECONDS:-30}
-      - REDIS_URL=${REDIS_URL}
-      - WORKER_MODE=crawler_ingest
-    restart: unless-stopped
-
-volumes:
-  postgres_data:
