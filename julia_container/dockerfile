@@ -5,7 +5,7 @@ FROM julia:1.10
 WORKDIR /app
 
 # Enable multi-threading by default (can be overridden at runtime)
-ENV JULIA_NUM_THREADS=auto
+ENV JULIA_NUM_THREADS=2
 
 # Pre-install Julia packages to leverage Docker layer caching.
 # This step only re-runs if the package list changes.

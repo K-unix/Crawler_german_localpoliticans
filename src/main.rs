@@ -543,6 +543,14 @@ async fn save_html_to_s3(
     Ok(key)
 }
 
+fn log_idle_queue(worker_id: usize, queue: &str) {
+    tracing::info!(
+        worker_id = worker_id,
+        queue = %queue,
+        "No jobs found in Redis queue; worker will retry"
+    );
+}
+
 async fn worker_loop(worker_id: usize, settings: Arc<WorkerConfig>) -> Result<(), DynError> {
     tracing::info!(worker_id = worker_id, "Starting worker");
 
@@ -614,7 +622,10 @@ async fn worker_loop(worker_id: usize, settings: Arc<WorkerConfig>) -> Result<()
         let result: Option<(String, String)> = redis_con.brpop(url_queue_key.as_str(), 5.0).await?;
         let task_json = match result {
             Some((_, json)) => json,
-            None => continue,
+            None => {
+                log_idle_queue(worker_id, &url_queue_key);
+                continue;
+            }
         };
 
         let task: UrlTask = match serde_json::from_str(&task_json) {

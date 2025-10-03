@@ -8,14 +8,65 @@ using SHA
 using Printf
 using Logging
 using Dates
-using Base.Threads
+using Base.Threads: ReentrantLock, @threads, nthreads, threadid
 using Base: basename
 using JSON
 using Random
 
 const CONSOLE_LOGGER = ConsoleLogger(stdout)
 global_logger(CONSOLE_LOGGER)
-const REDIS_LOGGING_INITIALIZED = Ref(false)
+
+# Metrics tracking
+mutable struct ProcessingMetrics
+    jobs_processed::Int
+    jobs_failed::Int
+    jobs_succeeded::Int
+    batches_processed::Int
+    html_bytes_processed::Int
+    jsonl_files_uploaded::Int
+    s3_download_failures::Int
+    s3_upload_failures::Int
+    html_cleaning_failures::Int
+    last_reset::DateTime
+    lock::ReentrantLock
+end
+
+function ProcessingMetrics()
+    ProcessingMetrics(0, 0, 0, 0, 0, 0, 0, 0, 0, Dates.now(Dates.UTC), ReentrantLock())
+end
+
+const METRICS = ProcessingMetrics()
+const METRICS_REPORTER_STARTED = Ref(false)
+
+function increment_metric!(metrics::ProcessingMetrics, field::Symbol, value::Int=1)
+    lock(metrics.lock) do
+        setfield!(metrics, field, getfield(metrics, field) + value)
+    end
+end
+
+function get_metrics_snapshot(metrics::ProcessingMetrics)
+    lock(metrics.lock) do
+        elapsed = Dates.value(Dates.now(Dates.UTC) - metrics.last_reset) / 1000.0
+        Dict(
+            "jobs_processed" => metrics.jobs_processed,
+            "jobs_failed" => metrics.jobs_failed,
+            "jobs_succeeded" => metrics.jobs_succeeded,
+            "batches_processed" => metrics.batches_processed,
+            "html_bytes_processed" => metrics.html_bytes_processed,
+            "jsonl_files_uploaded" => metrics.jsonl_files_uploaded,
+            "s3_download_failures" => metrics.s3_download_failures,
+            "s3_upload_failures" => metrics.s3_upload_failures,
+            "html_cleaning_failures" => metrics.html_cleaning_failures,
+            "uptime_seconds" => round(elapsed, digits=2),
+            "jobs_per_second" => elapsed > 0 ? round(metrics.jobs_processed / elapsed, digits=3) : 0.0
+        )
+    end
+end
+
+function log_metrics_summary()
+    snapshot = get_metrics_snapshot(METRICS)
+    @info "Metrics Summary" snapshot...
+end
 
 # --- CONFIGURATION LOADER ---
 function get_env_var(key::String, default::String="")::String
@@ -232,10 +283,15 @@ function minio_put_object(client::MinioClient, bucket::AbstractString, key::Abst
     nothing
 end
 
-struct RedisListLogger <: AbstractLogger
+struct ThreadSafeRedisLogger <: AbstractLogger
     conn::Redis.RedisConnection
     list_name::String
     min_level::LogLevel
+    lock::ReentrantLock
+end
+
+function ThreadSafeRedisLogger(conn::Redis.RedisConnection, list_name::String, min_level::LogLevel=Logging.Info)
+    ThreadSafeRedisLogger(conn, list_name, min_level, ReentrantLock())
 end
 
 struct CompositeLogger{L1<:AbstractLogger,L2<:AbstractLogger} <: AbstractLogger
@@ -243,14 +299,15 @@ struct CompositeLogger{L1<:AbstractLogger,L2<:AbstractLogger} <: AbstractLogger
     secondary::L2
 end
 
-Logging.min_enabled_level(logger::RedisListLogger) = logger.min_level
-Logging.shouldlog(logger::RedisListLogger, level, _module, group, id) = level >= logger.min_level
-Logging.catch_exceptions(::RedisListLogger) = true
+Logging.min_enabled_level(logger::ThreadSafeRedisLogger) = logger.min_level
+Logging.shouldlog(logger::ThreadSafeRedisLogger, level, _module, group, id) = level >= logger.min_level
+Logging.catch_exceptions(::ThreadSafeRedisLogger) = true
 
-function Logging.handle_message(logger::RedisListLogger, level, message, _module, group, id, file, line; kwargs...)
+function Logging.handle_message(logger::ThreadSafeRedisLogger, level, message, _module, group, id, file, line; kwargs...)
     msg_body = message isa Function ? message() : message
     level_str = string(level)
     timestamp = Dates.format(Dates.now(Dates.UTC), dateformat"yyyy-mm-ddTHH:MM:SS.sssZ")
+
     meta_pairs = String[]
     for (k, v) in kwargs
         push!(meta_pairs, string(k, "=", repr(v)))
@@ -261,14 +318,17 @@ function Logging.handle_message(logger::RedisListLogger, level, message, _module
     if group !== nothing
         push!(meta_pairs, string("group=", group))
     end
+
     entry = isempty(meta_pairs) ?
         string(timestamp, " [", level_str, "] ", msg_body) :
         string(timestamp, " [", level_str, "] ", msg_body, " | ", join(meta_pairs, " "))
-    try
-        Redis.rpush(logger.conn, logger.list_name, entry)
-    catch err
-        # Swallow logging errors but surface them on stderr for visibility.
-        Base.println(stderr, "Redis logging failure: ", err)
+
+    lock(logger.lock) do
+        try
+            Redis.rpush(logger.conn, logger.list_name, entry)
+        catch err
+            Base.println(stderr, "Redis logging failure (thread $(threadid())): ", err)
+        end
     end
 end
 
@@ -287,18 +347,68 @@ function Logging.handle_message(logger::CompositeLogger, level, message, _module
     end
 end
 
-function setup_redis_logging()
+mutable struct LoggingManager
+    redis_conn::Union{Nothing, Redis.RedisConnection}
+    is_initialized::Bool
+    lock::ReentrantLock
+end
+
+const LOGGING_MANAGER = LoggingManager(nothing, false, ReentrantLock())
+
+function setup_redis_logging_fixed()
     isempty(CONFIG.REDIS_LOG_LIST) && return
-    REDIS_LOGGING_INITIALIZED[] && return
-    try
-        logger_conn = Redis.RedisConnection(host=CONFIG.REDIS_HOST, port=CONFIG.REDIS_PORT)
-        redis_logger = RedisListLogger(logger_conn, CONFIG.REDIS_LOG_LIST, Logging.Info)
-        global_logger(CompositeLogger(CONSOLE_LOGGER, redis_logger))
-        REDIS_LOGGING_INITIALIZED[] = true
-        @info "Redis logging enabled" list=CONFIG.REDIS_LOG_LIST
-    catch err
-        @warn "Failed to initialize Redis logging; continuing with console logging only." exception=(err, catch_backtrace())
+
+    lock(LOGGING_MANAGER.lock) do
+        LOGGING_MANAGER.is_initialized && return
+
+        try
+            conn = Redis.RedisConnection(host=CONFIG.REDIS_HOST, port=CONFIG.REDIS_PORT)
+            redis_logger = ThreadSafeRedisLogger(conn, CONFIG.REDIS_LOG_LIST, Logging.Info)
+            global_logger(CompositeLogger(CONSOLE_LOGGER, redis_logger))
+
+            LOGGING_MANAGER.redis_conn = conn
+            LOGGING_MANAGER.is_initialized = true
+            atexit(cleanup_logging)
+
+            @info "Redis logging enabled (thread-safe)" list=CONFIG.REDIS_LOG_LIST threads=nthreads()
+        catch err
+            @warn "Failed to initialize Redis logging; continuing with console logging only." exception=(err, catch_backtrace())
+        end
     end
+end
+
+function cleanup_logging()
+    lock(LOGGING_MANAGER.lock) do
+        if LOGGING_MANAGER.redis_conn !== nothing
+            try
+                @info "Cleaning up Redis logging connection"
+                LOGGING_MANAGER.redis_conn = nothing
+            catch err
+                @warn "Error during logging cleanup" exception=(err, catch_backtrace())
+            end
+        end
+    end
+end
+
+function start_metrics_reporter(interval_seconds::Int=60)
+    if METRICS_REPORTER_STARTED[]
+        return
+    end
+
+    METRICS_REPORTER_STARTED[] = true
+
+    @async begin
+        while true
+            try
+                sleep(interval_seconds)
+                log_metrics_summary()
+            catch err
+                @error "Metrics reporter error" exception=(err, catch_backtrace())
+            end
+        end
+    end
+
+    nothing
 end
 
 # --- CORE CLEANING FUNCTION ---
@@ -441,9 +551,11 @@ function process_queue()
         end
     end
 
-    setup_redis_logging()
+    setup_redis_logging_fixed()
 
-    @info "Worker started." queue=CONFIG.REDIS_QUEUE_NAME
+    start_metrics_reporter(60)
+
+    @info "Worker started." queue=CONFIG.REDIS_QUEUE_NAME threads=nthreads()
 
     queue_name = CONFIG.REDIS_QUEUE_NAME
 
@@ -464,6 +576,7 @@ function process_queue()
         end
 
         @info "Processing batch." batch_size=length(batch)
+        increment_metric!(METRICS, :batches_processed)
 
         json_lines = Vector{Union{Nothing,String}}(undef, length(batch))
         for i in eachindex(json_lines)
@@ -472,25 +585,40 @@ function process_queue()
 
         @threads for i in eachindex(batch)
             source_key = batch[i]
+            increment_metric!(METRICS, :jobs_processed)
+
             try
-                @info "Processing job." source_key=source_key
+                @info "Processing job." source_key=source_key thread_id=threadid()
 
                 @info "Downloading from S3." bucket=CONFIG.S3_SOURCE_BUCKET key=source_key
                 html_content = try
                     download_html(CONFIG.S3_SOURCE_BUCKET, source_key)
                 catch err
+                    increment_metric!(METRICS, :s3_download_failures)
+                    increment_metric!(METRICS, :jobs_failed)
                     @error "Failed to download source object." bucket=CONFIG.S3_SOURCE_BUCKET key=source_key exception=(err, catch_backtrace())
                     json_lines[i] = nothing
                     continue
                 end
 
-                cleaned_html = clean_html_content(html_content)
+                increment_metric!(METRICS, :html_bytes_processed, length(html_content))
+
+                cleaned_html = try
+                    clean_html_content(html_content)
+                catch err
+                    increment_metric!(METRICS, :html_cleaning_failures)
+                    increment_metric!(METRICS, :jobs_failed)
+                    @error "HTML cleaning failed, using original." key=source_key exception=(err, catch_backtrace())
+                    html_content
+                end
 
                 @info "Uploading cleaned HTML to S3." bucket=CONFIG.S3_DESTINATION_BUCKET key=source_key
                 try
                     upload_object(CONFIG.S3_DESTINATION_BUCKET, source_key, cleaned_html, "text/html; charset=utf-8")
                     @info "Upload complete." key=source_key
                 catch err
+                    increment_metric!(METRICS, :s3_upload_failures)
+                    increment_metric!(METRICS, :jobs_failed)
                     @error "Failed to upload cleaned HTML." bucket=CONFIG.S3_DESTINATION_BUCKET key=source_key exception=(err, catch_backtrace())
                     json_lines[i] = nothing
                     continue
@@ -522,9 +650,11 @@ function process_queue()
                 )
 
                 json_lines[i] = JSON.json(request_obj; canonical=true)
-                @info "Prepared JSONL entry." key=source_key custom_id=custom_id
+                increment_metric!(METRICS, :jobs_succeeded)
+                @info "Prepared JSONL entry." key=source_key custom_id=custom_id thread_id=threadid()
             catch e
                 json_lines[i] = nothing
+                increment_metric!(METRICS, :jobs_failed)
                 @error "An error occurred during job processing." key=source_key exception=(e, catch_backtrace())
             end
         end
@@ -558,6 +688,7 @@ function process_queue()
 
             jsonl_content = read(temp_path, String)
             upload_object(CONFIG.S3_JSONL_BUCKET, object_key, jsonl_content, "application/json")
+            increment_metric!(METRICS, :jsonl_files_uploaded)
             @info "Uploaded batch JSONL." bucket=CONFIG.S3_JSONL_BUCKET key=object_key lines=length(valid_lines)
         catch err
             @error "Failed to upload JSONL batch." bucket=CONFIG.S3_JSONL_BUCKET key=object_key exception=(err, catch_backtrace())

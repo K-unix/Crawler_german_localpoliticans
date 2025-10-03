@@ -116,6 +116,7 @@ OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL") or os.getenv("LLM_API_BASE")
 OPENAI_BATCH_COMPLETION_WINDOW = os.getenv("OPENAI_BATCH_COMPLETION_WINDOW", "24h")
 OPENAI_BATCH_POLL_INTERVAL = max(5.0, float(os.getenv("OPENAI_BATCH_POLL_INTERVAL", "30")))
 OPENAI_BATCH_SUBMIT_INTERVAL = max(1.0, float(os.getenv("OPENAI_BATCH_SUBMIT_INTERVAL", "10")))
+OPENAI_BATCH_MAX_BYTES = int(os.getenv("OPENAI_BATCH_MAX_BYTES", "5000000"))
 
 # LLM payload expectations
 LLM_COLLECTION_KEY = os.getenv("LLM_MEMBERS_KEY", "ratsmitglieder")
@@ -310,6 +311,30 @@ def fetch_s3_object(bucket: str, key: str) -> Optional[bytes]:
         return None
 
 
+def split_batch_content(content: bytes, max_bytes: int) -> List[bytes]:
+    if len(content) <= max_bytes:
+        return [content]
+
+    segments: List[bytes] = []
+    current = bytearray()
+    for line in content.splitlines(keepends=True):
+        if not line:
+            continue
+        if len(line) > max_bytes:
+            raise BatchInputParseError(
+                "Single JSONL line exceeds batch size limit of %s bytes" % max_bytes
+            )
+        if len(current) + len(line) > max_bytes:
+            segments.append(bytes(current))
+            current = bytearray()
+        current.extend(line)
+
+    if current:
+        segments.append(bytes(current))
+
+    return segments
+
+
 def inspect_batch_input(content: bytes) -> BatchInputParseResult:
     endpoint = None
     request_metadata: Dict[str, Dict[str, Any]] = {}
@@ -362,13 +387,22 @@ def upload_batch_file(content: bytes) -> Optional[str]:
     return file_id
 
 
-def create_batch_job(file_id: str, endpoint: str, task: BatchInputTask, request_count: int) -> Optional[str]:
+def create_batch_job(
+    file_id: str,
+    endpoint: str,
+    task: BatchInputTask,
+    request_count: int,
+    chunk_index: int,
+    chunk_total: int,
+) -> Optional[str]:
     if openai_client is None:
         return None
     metadata = {
         "input_bucket": task.bucket,
         "input_key": task.key,
         "request_count": request_count,
+        "chunk_index": chunk_index,
+        "chunk_total": chunk_total,
     }
     try:
         response = openai_client.batches.create(
@@ -391,43 +425,67 @@ def create_batch_job(file_id: str, endpoint: str, task: BatchInputTask, request_
             "input_bucket": task.bucket,
             "input_key": task.key,
             "input_file_id": file_id,
+            "chunk_index": chunk_index,
+            "chunk_total": chunk_total,
             "requested_at": dt.datetime.utcnow().isoformat(),
         },
     )
     return job_id
 
 
-def submit_batch_task(task: BatchInputTask) -> Optional[str]:
+def submit_batch_task(task: BatchInputTask) -> List[str]:
+    job_ids: List[str] = []
     if redis_client.sismember(REDIS_BATCH_INPUT_SET, task.key):
         LOGGER.debug("Batch input %s already submitted; skipping", task.key)
-        return None
+        return job_ids
     content = fetch_s3_object(task.bucket, task.key)
     if content is None:
-        return None
+        return job_ids
+
     try:
-        parse_result = inspect_batch_input(content)
+        chunks = split_batch_content(content, OPENAI_BATCH_MAX_BYTES)
     except BatchInputParseError:
-        LOGGER.exception("Batch input %s is invalid JSONL; skipping", task.key)
+        LOGGER.exception("Batch input %s contains an oversized record; skipping", task.key)
+        return job_ids
+
+    total_chunks = len(chunks)
+    for idx, chunk in enumerate(chunks, start=1):
+        try:
+            parse_result = inspect_batch_input(chunk)
+        except BatchInputParseError:
+            LOGGER.exception("Batch input %s chunk %s is invalid JSONL; skipping", task.key, idx)
+            continue
+
+        file_id = upload_batch_file(chunk)
+        if not file_id:
+            continue
+        job_id = create_batch_job(
+            file_id,
+            parse_result.endpoint,
+            task,
+            parse_result.request_count,
+            idx,
+            total_chunks,
+        )
+        if not job_id:
+            continue
+
+        redis_client.sadd(REDIS_BATCH_PENDING_SET, job_id)
+        job_ids.append(job_id)
+        LOGGER.info(
+            "Submitted OpenAI batch job %s (%s requests, chunk %s/%s) for s3://%s/%s",
+            job_id,
+            parse_result.request_count,
+            idx,
+            total_chunks,
+            task.bucket,
+            task.key,
+        )
+
+    if job_ids:
         redis_client.sadd(REDIS_BATCH_INPUT_SET, task.key)
-        return None
 
-    file_id = upload_batch_file(content)
-    if not file_id:
-        return None
-    job_id = create_batch_job(file_id, parse_result.endpoint, task, parse_result.request_count)
-    if not job_id:
-        return None
-
-    redis_client.sadd(REDIS_BATCH_INPUT_SET, task.key)
-    redis_client.sadd(REDIS_BATCH_PENDING_SET, job_id)
-    LOGGER.info(
-        "Submitted OpenAI batch job %s (%s requests) for s3://%s/%s",
-        job_id,
-        parse_result.request_count,
-        task.bucket,
-        task.key,
-    )
-    return job_id
+    return job_ids
 
 
 def discover_new_batch_inputs(limit: int) -> List[BatchInputTask]:
@@ -834,8 +892,13 @@ def poll_pending_batches() -> None:
         store_job_state(job_id, {"status": status, "last_checked": dt.datetime.utcnow().isoformat()})
 
         if status == "completed":
-            output_file_ids = getattr(batch, "output_file_ids", None) or batch.get("output_file_ids") or []
-            process_batch_outputs(job_id, list(output_file_ids))
+            output_file_ids = list(
+                getattr(batch, "output_file_ids", None) or batch.get("output_file_ids") or []
+            )
+            single_output = getattr(batch, "output_file_id", None)
+            if single_output and single_output not in output_file_ids:
+                output_file_ids.append(single_output)
+            process_batch_outputs(job_id, output_file_ids)
             redis_client.srem(REDIS_BATCH_PENDING_SET, job_id)
             redis_client.sadd(REDIS_BATCH_COMPLETED_SET, job_id)
             store_job_state(job_id, {"completed_at": dt.datetime.utcnow().isoformat()})

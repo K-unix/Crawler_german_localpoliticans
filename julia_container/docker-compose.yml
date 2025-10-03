@@ -17,6 +17,9 @@ services:
       - REDIS_HOST=redis  # Use the service name to connect
       - REDIS_PORT=6379
       - REDIS_QUEUE_NAME=html_processing_queue
+    labels:
+      - com.rustcrawler.logs=true
+      - com.rustcrawler_service=julia_cleaner
     restart: unless-stopped
 
 volumes:

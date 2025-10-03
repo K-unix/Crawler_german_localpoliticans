@@ -1,9 +1,10 @@
+import io
 import json
 import os
 import re
 import time
 from datetime import datetime
-from typing import Optional
+from typing import Dict, List, Optional
 
 import boto3
 import openai
@@ -37,6 +38,7 @@ DB_QUERY = "SELECT name, partei, position, kommune FROM politicians_output;"
 BATCH_MODEL = "gpt-5-mini"
 BATCH_TEMPERATURE = 0.10
 BATCH_COMPLETION_WINDOW = "24h"
+BATCH_MAX_BYTES = int(os.getenv("OPENAI_BATCH_MAX_BYTES", "5000000"))
 BATCH_INPUT_FILENAME = "batch_judge_requests.jsonl"
 DETAILED_RESULTS_CSV = "validation_results_detailed.csv"
 HTML_REPORT_FILENAME = "validation_report.html"
@@ -242,38 +244,129 @@ def prepare_batch_file(pipeline_data, official_data_folder, benchmark_list):
     print(f"✅ Batch input file '{BATCH_INPUT_FILENAME}' created with {len(requests)} requests.")
     return BATCH_INPUT_FILENAME
 
+def _split_batch_content(content: bytes, max_bytes: int) -> List[bytes]:
+    if len(content) <= max_bytes:
+        return [content]
+
+    segments: List[bytes] = []
+    current = bytearray()
+    for line in content.splitlines(keepends=True):
+        if not line:
+            continue
+        if len(line) > max_bytes:
+            raise ValueError(
+                f"A single JSONL line exceeds the batch size limit of {max_bytes} bytes"
+            )
+        if len(current) + len(line) > max_bytes:
+            segments.append(bytes(current))
+            current = bytearray()
+        current.extend(line)
+    if current:
+        segments.append(bytes(current))
+    return segments
+
+
+def _file_content_to_bytes(response) -> bytes:
+    for attr in ("content", "data", "body", "text"):
+        value = getattr(response, attr, None)
+        if value is None:
+            continue
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, str):
+            return value.encode("utf-8")
+    for attr in ("read", "getvalue"):
+        if hasattr(response, attr):
+            try:
+                value = getattr(response, attr)()
+            except Exception:
+                continue
+            if isinstance(value, bytes):
+                return value
+            if isinstance(value, str):
+                return value.encode("utf-8")
+    if isinstance(response, bytes):
+        return response
+    raise TypeError(f"Unsupported OpenAI file response type: {type(response).__name__}")
+
+
 def run_openai_batch_job(client, batch_input_file):
-    """Creates, runs, and monitors an OpenAI batch job."""
+    """Creates, runs, and monitors one or more OpenAI batch jobs."""
     print("\n--- Starting OpenAI Batch Job ---")
-    
-    print(f"Uploading file '{batch_input_file}'...")
-    batch_file = client.files.create(file=open(batch_input_file, "rb"), purpose="batch")
-    print(f"File uploaded with ID: {batch_file.id}")
 
-    print("Creating batch job...")
-    batch_job = client.batches.create(
-        input_file_id=batch_file.id,
-        endpoint="/v1/chat/completions",
-        completion_window=BATCH_COMPLETION_WINDOW
-    )
-    print(f"Batch job created with ID: {batch_job.id}")
+    with open(batch_input_file, "rb") as handle:
+        full_content = handle.read()
 
-    print("Waiting for batch job to complete... (this may take a while)")
-    while batch_job.status not in ["completed", "failed", "cancelled"]:
-        time.sleep(30)
-        batch_job = client.batches.retrieve(batch_job.id)
-        print(f"Current status: {batch_job.status} ({time.strftime('%H:%M:%S')})")
-
-    if batch_job.status != "completed":
-        print(f" Batch job did not complete successfully. Final status: {batch_job.status}")
+    try:
+        chunks = _split_batch_content(full_content, BATCH_MAX_BYTES)
+    except ValueError as exc:
+        print(f"❌ {exc}")
         return None
 
-    print(" Batch job completed!")
-    
-    output_file_id = batch_job.output_file_id
-    print(f"Downloading results from file ID: {output_file_id}")
-    result_content = client.files.content(output_file_id).content.decode('utf-8')
-    return result_content
+    print(f"Preparing {len(chunks)} batch file(s) for upload (limit {BATCH_MAX_BYTES} bytes each)...")
+
+    pending_jobs: Dict[str, Dict[str, int]] = {}
+    for idx, chunk in enumerate(chunks, start=1):
+        buffer = io.BytesIO(chunk)
+        buffer.name = f"batch-part-{idx}.jsonl"
+        batch_file = client.files.create(file=buffer, purpose="batch")
+        print(f"Uploaded chunk {idx}/{len(chunks)} as file ID: {batch_file.id}")
+
+        batch_job = client.batches.create(
+            input_file_id=batch_file.id,
+            endpoint="/v1/chat/completions",
+            completion_window=BATCH_COMPLETION_WINDOW,
+            metadata={
+                "source_file": os.path.basename(batch_input_file),
+                "chunk_index": idx,
+                "chunk_total": len(chunks),
+            },
+        )
+        print(f"Created batch job {batch_job.id} for chunk {idx}/{len(chunks)}")
+        pending_jobs[batch_job.id] = {"chunk_index": idx, "chunk_total": len(chunks)}
+
+    if not pending_jobs:
+        print("⚠️ No batch jobs were created.")
+        return None
+
+    print("Waiting for batch job(s) to complete... (this may take a while)")
+    results: List[str] = []
+    while pending_jobs:
+        time.sleep(30)
+        for job_id in list(pending_jobs.keys()):
+            job_state = pending_jobs[job_id]
+            chunk_desc = f"chunk {job_state['chunk_index']}/{job_state['chunk_total']}"
+            try:
+                batch_job = client.batches.retrieve(job_id)
+            except Exception as exc:
+                print(f"⚠️ Failed to retrieve status for {job_id} ({chunk_desc}): {exc}")
+                continue
+
+            status = getattr(batch_job, "status", None) or batch_job.get("status")
+            print(f"Current status for {job_id} ({chunk_desc}): {status} ({time.strftime('%H:%M:%S')})")
+
+            if status == "completed":
+                output_file_ids = getattr(batch_job, "output_file_ids", None) or []
+                single_output = getattr(batch_job, "output_file_id", None)
+                if single_output and single_output not in output_file_ids:
+                    output_file_ids.append(single_output)
+                for output_file_id in output_file_ids:
+                    try:
+                        download = client.files.content(output_file_id)
+                        content_bytes = _file_content_to_bytes(download)
+                        results.append(content_bytes.decode("utf-8"))
+                        print(f"Downloaded results for {job_id} ({chunk_desc})")
+                    except Exception as exc:
+                        print(f"⚠️ Failed to download results for {job_id}: {exc}")
+                pending_jobs.pop(job_id, None)
+            elif status in {"failed", "cancelled", "expired"}:
+                print(f"❌ Batch job {job_id} ({chunk_desc}) ended with status: {status}")
+                pending_jobs.pop(job_id, None)
+
+    if not results:
+        return None
+
+    return "\n".join(results)
 
 def generate_html_report(stats, confidence_df, reasons_df):
     """Generates a styled HTML report from the validation statistics."""
