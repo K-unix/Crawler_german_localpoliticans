@@ -17,6 +17,9 @@ services:
       - REDIS_HOST=redis  # Use the service name to connect
       - REDIS_PORT=6379
       - REDIS_QUEUE_NAME=html_processing_queue
+      - REDIS_LOG_LIST=${REDIS_LOG_LIST:-crawler:logs:julia}
+      - REDIS_LOG_ENDPOINT=${REDIS_LOG_ENDPOINT:-redis://redis:6379/}
+      - REDIS_LOG_KEY=${REDIS_LOG_KEY:-crawler:logs}
     labels:
       - com.rustcrawler.logs=true
       - com.rustcrawler_service=julia_cleaner
